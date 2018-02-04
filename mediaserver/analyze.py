@@ -1,15 +1,16 @@
 import logging
 import asyncio
 
-import gbulb
-gbulb.install()
+import os
 
 import gi
 gi.require_version('Gst', '1.0')
-gi.require_version('GstVideo', '1.0')
-from gi.repository import Gst, GstVideo, GLib
+gi.require_version('GstApp', '1.0')
+from gi.repository import Gst, GstApp, GLib
 
 Gst.init(None)
+
+from convert import FrameConverter
 
 def create_taglist_getters(tag_list):
     # Generate a function for a TagList that works around GStreamer's introspected weirdness
@@ -38,6 +39,13 @@ class Analyzer:
         
         self.tracks = []
         self.metadata = {}
+
+        self.duration = None
+        self.poster_time = None
+        self.poster_track = None
+        self.poster_sample = None
+        
+        self.converters = set()
         
         self.pipeline = Gst.Pipeline.new()
         self.bus = self.pipeline.get_bus()
@@ -56,7 +64,30 @@ class Analyzer:
         self.analyzing = True
         
         while self.analyzing:
+            Gst.debug_bin_to_dot_file(self.pipeline, Gst.DebugGraphDetails.ALL, 'analyze')
+            res, state, pending = self.pipeline.get_state(1)
+            if state == Gst.State.PLAYING and self.duration == None:
+                query = Gst.Query.new_duration(Gst.Format.TIME)
+                if self.decodebin.query(query):
+                    fmt, duration = query.parse_duration()
+                    if duration:
+                        logging.info('Media duration is {}'.format(duration))
+                        self.duration = duration
+                        self.poster_time = duration * 0.1 # One-tenth of the way through the video (only applies to videos)
+
             await asyncio.sleep(1)
+
+        if self.poster_sample:
+#        filename = os.path.join(self.mediaserver.tempdir, '{}-tagimage.jpg')
+            self.poster = os.path.join('/', 'tmp', '{}-poster.jpg'.format(self._id))
+            self.converters.add(FrameConverter(self.poster_sample, self.poster))
+
+            self.thumb = os.path.join('/', 'tmp', '{}-thumb.jpg'.format(self._id))
+            self.converters.add(FrameConverter(self.poster_sample, self.thumb, width = 256))
+        
+        while True:
+            if all((c.complete for c in self.converters)): break
+            else: await asyncio.sleep(1)
         
         logging.info('Finished analysis of URI {} with id {}'.format(self.uri, self._id))
         self.pipeline.set_state(Gst.State.NULL)
@@ -69,10 +100,10 @@ class Analyzer:
             logging.error('GStreamer error for media {}: {}'.format(self._id, msg.parse_error()))
             Gst.debug_bin_to_dot_file(self.pipeline, Gst.DebugGraphDetails.ALL, 'analyze')
         
-        if msg.type == Gst.MessageType.WARNING:
+        elif msg.type == Gst.MessageType.WARNING:
             logging.warning('GStreamer warning for media {}: {}'.format(self._id, msg.parse_error()))
         
-        if msg.type == Gst.MessageType.TAG:
+        elif msg.type == Gst.MessageType.TAG:
             tag_list = msg.parse_tag()
             
             gs, gu, gd = create_taglist_getters(tag_list)
@@ -96,10 +127,12 @@ class Analyzer:
             for k, v in metadata.items():
                 if not v == None: self.metadata[k] = v
             
-            # TODO: get album art from taglist, make poster/thumbnails for image/videos, actually hook up to cedarserver
-            
-        if msg.type == Gst.MessageType.EOS:
-            logging.debug('eos')
+            found, imagesample = tag_list.get_sample(Gst.TAG_IMAGE)
+            if found and not self.tagimage_processed:
+                logging.info('Found poster image in file tag')
+                self.poster_sample = sample
+                
+        elif msg.type == Gst.MessageType.EOS:
             Gst.debug_bin_to_dot_file(self.pipeline, Gst.DebugGraphDetails.ALL, 'analyze')
             self.analyzing = False
     
@@ -151,12 +184,39 @@ class Analyzer:
                     track['type'] = 'video'
                     track['framerate'] = round(numerator / float(denominator), 2)
                 
-                fake = Gst.ElementFactory.make('fakesink', 'fakesink' + suffix)
-                self.pipeline.add(fake)
-                pad.link(fake.get_static_pad('sink'))
-                fake.set_state(Gst.State.PLAYING)
+                if self.poster_track:
+                    fake = Gst.ElementFactory.make('fakesink', 'fakesink' + suffix)
+                    self.pipeline.add(fake)
+                    pad.link(fake.get_static_pad('sink'))
+                    fake.set_state(Gst.State.PLAYING)
+
+                else:
+                    self.poster_track = track
+                    app = Gst.ElementFactory.make('appsink', 'appsink' + suffix)
+                    app.set_property('emit-signals', True)
+                    app.set_property('drop', True)
+                    app.set_property('caps', Gst.Caps.from_string('video/x-raw'))
+                    app.connect('new-sample', self.poster_track_new_sample, track)
+
+                    self.pipeline.add(app)
+                    pad.link(app.get_static_pad('sink'))
+                    app.set_state(Gst.State.PLAYING)
             
             else:
-                track['type'] = 'inavlid'
+                track['type'] = 'invalid'
             
             self.tracks.append(track)
+    
+    def poster_track_new_sample(self, appsink, track):
+        # TODO make this work with grabbing image samples too
+        sample = appsink.emit('pull-sample')
+
+        if not self.poster_sample and not self.poster_time == None:
+            query = Gst.Query.new_position(Gst.Format.TIME)
+
+            if self.decodebin.query(query):
+                fmt, position = query.parse_position()
+                if position and position >= self.poster_time:
+                    self.poster_sample = sample
+        
+        return Gst.FlowReturn.OK

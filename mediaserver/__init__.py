@@ -2,6 +2,11 @@ import json
 import asyncio
 import websockets
 
+import gbulb
+gbulb.install()
+
+import tempfile
+
 import logging
 logging.basicConfig(level = logging.DEBUG)
 
@@ -12,6 +17,7 @@ import analyze
 class MediaServer:
     def __init__(self):
         self.websocket = None
+        self.tempdir = tempfile.mkdtemp(prefix = 'cedarmediaserver')
                 
     def start(self):
         asyncio.run_until_complete(self.socket_loop())
