@@ -1,107 +1,193 @@
+import os
+import json
 import logging
 import asyncio
 
-import os
-
 import gi
 gi.require_version('Gst', '1.0')
-gi.require_version('GstApp', '1.0')
-from gi.repository import Gst, GstApp, GLib
+from gi.repository import Gst
 
 Gst.init(None)
 
-from convert import FrameConverter
+from .convert import FrameConverter
+from .grabber import FrameGrabber
+from .audioanalyzer import AudioAnalyzer
 
-def create_taglist_getters(tag_list):
-    # Generate a function for a TagList that works around GStreamer's introspected weirdness
-    def gs(tag):
-        found, val = tag_list.get_string(tag)
-        if found: return val
-        else: return None
-    
-    def gu(tag):
-        found, val = tag_list.get_uint(tag)
-        if found: return val
-        else: return None
-    
-    def gd(tag):
-        found, val = tag_list.get_double(tag)
-        if found: return val
-        else: return None
-            
-    return gs, gu, gd
+from .taglist_utils import create_taglist_getters
 
 class Analyzer:
-    def __init__(self, _id, uri, mediaserver):
-        self._id = _id
-        self.uri = uri
-        self.mediaserver = mediaserver
+    # TODO this should be split into two classes, one that does all the management stuff in analyze() and one to do the inital tracks data grab.
+    def __init__(self, directory, filename):
+        self.directory = directory
+        self.filename = filename
+        self.uri = 'file:///{}/{}'.format(directory, filename)
         
         self.tracks = []
         self.metadata = {}
-
-        self.duration = None
-        self.poster_time = None
-        self.poster_track = None
-        self.poster_sample = None
         
-        self.converters = set()
+        self.tracks_done = False
+        self.duration = None
+        self.poster_sample = None
         
         self.pipeline = Gst.Pipeline.new()
         self.bus = self.pipeline.get_bus()
         self.bus.add_signal_watch()
         self.bus.connect('message', self.on_message)
         
-        self.decodebin = Gst.ElementFactory.make('uridecodebin', 'uridecodebin_{}'.format(self._id))
+        self.decodebin = Gst.ElementFactory.make('uridecodebin')
         self.decodebin.connect('pad-added', self.pad_added)
+        self.decodebin.connect('no-more-pads', self.no_more_pads)
         self.decodebin.set_property('uri', self.uri)
         
         self.pipeline.add(self.decodebin)
+    
+    def progress(self, amount):
+        print({'progress': amount})
         
     async def analyze(self):
-        logging.info('Starting analysis of URI {} with id {}'.format(self.uri, self._id))
-        self.pipeline.set_state(Gst.State.PLAYING)    
-        self.analyzing = True
+        # TODO handle invalid files properly
+        self.progress(0)
         
-        while self.analyzing:
-            Gst.debug_bin_to_dot_file(self.pipeline, Gst.DebugGraphDetails.ALL, 'analyze')
-            res, state, pending = self.pipeline.get_state(1)
-            if state == Gst.State.PLAYING and self.duration == None:
-                query = Gst.Query.new_duration(Gst.Format.TIME)
-                if self.decodebin.query(query):
-                    fmt, duration = query.parse_duration()
-                    if duration:
-                        logging.info('Media duration is {}'.format(duration))
-                        self.duration = duration
-                        self.poster_time = duration * 0.1 # One-tenth of the way through the video (only applies to videos)
-
-            await asyncio.sleep(1)
-
-        if self.poster_sample:
-#        filename = os.path.join(self.mediaserver.tempdir, '{}-tagimage.jpg')
-            self.poster = os.path.join('/', 'tmp', '{}-poster.jpg'.format(self._id))
-            self.converters.add(FrameConverter(self.poster_sample, self.poster))
-
-            self.thumb = os.path.join('/', 'tmp', '{}-thumb.jpg'.format(self._id))
-            self.converters.add(FrameConverter(self.poster_sample, self.thumb, width = 256))
+        logging.info('Starting analysis of URI {}'.format(self.uri))
+        self.pipeline.set_state(Gst.State.PLAYING)
         
-        while True:
-            if all((c.complete for c in self.converters)): break
-            else: await asyncio.sleep(1)
+        # Use decodebin to determine the media container's contents and get any metadata
+        while self.duration == None or not self.tracks_done:
+            res, state, pending = self.pipeline.get_state(10)
+            if self.duration == None and res == Gst.StateChangeReturn.SUCCESS and \
+                   (state == Gst.State.PAUSED or state == Gst.State.PLAYING):               
+                res, duration = self.decodebin.query_duration(Gst.Format.TIME)
+                if res:
+                    logging.info('Media duration is {}'.format(duration))
+                    self.duration = duration
+                else:
+                    self.duration = 0
+            
+            await asyncio.sleep(0.25)
         
-        logging.info('Finished analysis of URI {} with id {}'.format(self.uri, self._id))
         self.pipeline.set_state(Gst.State.NULL)
+        logging.info('Completed track and tag analysis')
         
-        print(self.metadata)
-        print(self.tracks)
+        self.progress(1 / 3)
+        
+        # Start audio analysis
+        audiofuture = None
+        if any(t['type'] == 'audio' for t in self.tracks) and \
+           (self.metadata.get('replaygain') == None or self.metadata.get('bpm') == None):
+            aa = AudioAnalyzer(self.uri, self.duration)
+            audiofuture = asyncio.ensure_future(aa.analyze())
+            logging.info('Starting audio analysis job')
+
+        # If metadata didn't contain a tag image, grab a frame from a video or image track if available
+        posterfuture = None
+        if not self.poster_sample:
+            best = None
+            
+            # Overly-complex track-selection logic on the tiny chance it gets fed media files with multiple video and image tracks
+            for track in self.tracks:
+                if track['type'] == 'video':
+                    if not best: best = track                        
+                    elif best['type'] == 'image': best = track
+                    elif best['type'] == 'video':
+                        if track['width'] * track['height'] > best['width'] * best['height']:
+                            best = track
+                
+                elif track['type'] == 'image':
+                    if not best: best = track                        
+                    elif best['type'] == 'image' and track['width'] * track['height'] > \
+                                                     best['width']  * best['height']:
+                        best = track
+            
+            if best:
+                logging.info('Starting poster frame grab job')
+                if best['type'] == 'video':
+                    # Grab a frame one-tenth of the way through the track
+                    pt = self.duration * 0.1
+                elif best['type'] == 'image':
+                    # Grab the first frame 'cause that's the only one. Duh.
+                    pt = 0
+                
+                grabber = FrameGrabber(self.uri, best['caps'], pt)
+                posterfuture = asyncio.ensure_future(grabber.grab())
+                
+
+        # Wait for audio tagging to complete, if in progress
+        if audiofuture:
+            # TODO actually do thing
+            replaygain, bpm = await audiofuture
+            
+            if self.metadata.get('replaygain') == None:
+                self.metadata['replaygain'] = replaygain
+            
+            if self.metadata.get('bpm') == None:
+                self.metadata['bpm'] = bpm
+            
+            logging.info('Audio analysis complete')
+
+        # Wait for frame grabbing to complete, if in progress
+        if posterfuture:
+            self.poster_sample = await posterfuture
+            logging.info('Poster frame grabbing complete')
+        
+        self.progress(2 / 3)
+        
+        if self.poster_sample:
+            logging.info('Starting poster and thumb frame convert and save jobs')
+            # TODO get directory to stuff these info from command-line args or whatever
+            postertitle = '{}.poster.jpg'.format(self.filename)
+            posterpath = os.path.join(self.directory, postertitle)
+            pfc = FrameConverter(self.poster_sample, posterpath, max_width = 1920)
+            pfuture = asyncio.ensure_future(pfc.convert())
+
+            thumbtitle = '{}.thumb.jpg'.format(self.filename)
+            thumbpath = os.path.join(self.directory, thumbtitle)
+            tfc = FrameConverter(self.poster_sample, thumbpath, width = 256)
+            tfuture = asyncio.ensure_future(tfc.convert())
+            
+            await pfuture, tfuture
+            logging.info('Created poster and thumbnail images')
+        else:
+            postertitle = ''
+            thumbtitle = ''
+                
+        logging.info('Finished analysis of URI {}'.format(self.uri))
+        
+        self.progress(3 / 3)
+        
+        _type = 'invalid'
+
+        for track in self.tracks:
+            del track['caps']
+            
+            # Determine the media type based on track types
+            if track['type'] == 'video':
+                _type = 'video'
+            elif track['type'] == 'audio' and not _type == 'video':
+                _type = 'audio'
+            elif track['type'] == 'image' and not _type == 'video' and not _type == 'audio':
+                _type = 'image'
+            
+        
+        return {
+            'result': {
+                'type': _type,
+                'tracks': self.tracks,
+                'metadata': self.metadata,
+                'poster': postertitle,
+                'thumb': thumbtitle
+            }
+        }
     
     def on_message(self, bus, msg):
         if msg.type == Gst.MessageType.ERROR:
-            logging.error('GStreamer error for media {}: {}'.format(self._id, msg.parse_error()))
             Gst.debug_bin_to_dot_file(self.pipeline, Gst.DebugGraphDetails.ALL, 'analyze')
+            logging.error('GStreamer error for media {}: {}'.format(self.filename, msg.parse_error()))
+            self.duration = 0
+            self.tracks = []
+            self.tracks_done = True
         
         elif msg.type == Gst.MessageType.WARNING:
-            logging.warning('GStreamer warning for media {}: {}'.format(self._id, msg.parse_error()))
+            logging.warning('GStreamer warning for media {}: {}'.format(self.filename, msg.parse_error()))
         
         elif msg.type == Gst.MessageType.TAG:
             tag_list = msg.parse_tag()
@@ -127,24 +213,24 @@ class Analyzer:
             for k, v in metadata.items():
                 if not v == None: self.metadata[k] = v
             
-            found, imagesample = tag_list.get_sample(Gst.TAG_IMAGE)
-            if found and not self.tagimage_processed:
-                logging.info('Found poster image in file tag')
-                self.poster_sample = sample
+            if not self.poster_sample:
+                found, sample = tag_list.get_sample(Gst.TAG_IMAGE)
+                if found:
+                    logging.info('Found poster image in file tag')
+                    self.poster_sample = sample
                 
         elif msg.type == Gst.MessageType.EOS:
-            Gst.debug_bin_to_dot_file(self.pipeline, Gst.DebugGraphDetails.ALL, 'analyze')
             self.analyzing = False
     
-    def pad_added(self, element, pad):
+    def pad_added(self, decodebin, pad):
         caps = pad.get_current_caps()
         
         if caps:
             struct = caps.get_structure(0)
             logging.debug('Track found with caps: {}'.format(struct.to_string()))
             
-            track = {}
-            suffix = '_{}_{}'.format(self._id, len(self.tracks))
+            track = {'caps': caps}
+            suffix = '_{}'.format(len(self.tracks))
 
             name = struct.get_name()
             _type = name.split('/')[0]
@@ -152,26 +238,6 @@ class Analyzer:
             if _type == 'audio':
                 track['type'] = 'audio'
                 track['samplerate'] = struct.get_value('rate')
-
-                ac = Gst.ElementFactory.make('audioconvert', 'audioconvert' + suffix)
-                self.pipeline.add(ac)
-                pad.link(ac.get_static_pad('sink'))
-                ac.set_state(Gst.State.PLAYING)
-
-                rg = Gst.ElementFactory.make('rganalysis', 'replaygain' + suffix)
-                self.pipeline.add(rg)
-                ac.link(rg)
-                rg.set_state(Gst.State.PLAYING)
-                
-                bp = Gst.ElementFactory.make('bpmdetect', 'bpmdetect' + suffix)
-                self.pipeline.add(bp)
-                rg.link(bp)
-                bp.set_state(Gst.State.PLAYING)
-                
-                fake = Gst.ElementFactory.make('fakesink', 'fakesink' + suffix)
-                self.pipeline.add(fake)
-                bp.link(fake)
-                fake.set_state(Gst.State.PLAYING)
             
             elif _type == 'video':
                 track['width'] = struct.get_value('width')
@@ -184,39 +250,15 @@ class Analyzer:
                     track['type'] = 'video'
                     track['framerate'] = round(numerator / float(denominator), 2)
                 
-                if self.poster_track:
-                    fake = Gst.ElementFactory.make('fakesink', 'fakesink' + suffix)
-                    self.pipeline.add(fake)
-                    pad.link(fake.get_static_pad('sink'))
-                    fake.set_state(Gst.State.PLAYING)
-
-                else:
-                    self.poster_track = track
-                    app = Gst.ElementFactory.make('appsink', 'appsink' + suffix)
-                    app.set_property('emit-signals', True)
-                    app.set_property('drop', True)
-                    app.set_property('caps', Gst.Caps.from_string('video/x-raw'))
-                    app.connect('new-sample', self.poster_track_new_sample, track)
-
-                    self.pipeline.add(app)
-                    pad.link(app.get_static_pad('sink'))
-                    app.set_state(Gst.State.PLAYING)
-            
             else:
                 track['type'] = 'invalid'
             
             self.tracks.append(track)
+            
+            fake = Gst.ElementFactory.make('fakesink', 'fakesink' + suffix)
+            self.pipeline.add(fake)
+            pad.link(fake.get_static_pad('sink'))
+            fake.set_state(Gst.State.PLAYING)
     
-    def poster_track_new_sample(self, appsink, track):
-        # TODO make this work with grabbing image samples too
-        sample = appsink.emit('pull-sample')
-
-        if not self.poster_sample and not self.poster_time == None:
-            query = Gst.Query.new_position(Gst.Format.TIME)
-
-            if self.decodebin.query(query):
-                fmt, position = query.parse_position()
-                if position and position >= self.poster_time:
-                    self.poster_sample = sample
-        
-        return Gst.FlowReturn.OK
+    def no_more_pads(self, decodebin):
+        self.tracks_done = True

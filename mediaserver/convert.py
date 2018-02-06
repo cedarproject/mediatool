@@ -4,13 +4,11 @@ import asyncio
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstApp', '1.0')
-from gi.repository import Gst, GstApp, GLib
-
-Gst.init(None)
+from gi.repository import Gst, GstApp
 
 class FrameConverter:
     '''Converts a Gst.Sample to a JPG file with specified dimensions'''
-    def __init__(self, sample, dest, width = None, height = None):
+    def __init__(self, sample, dest, width = None, height = None, max_width = None):
         self.complete = False
         
         self.sample = sample
@@ -33,6 +31,11 @@ class FrameConverter:
             self.width = width
             self.height = height
         
+        if max_width:
+            ratio = self.width / self.height
+            self.width = max_width
+            self.height = int(round(max_width / ratio))
+        
         if self.struct.get_name() == 'image/jpeg' and width and height:
             self.pipeline = Gst.parse_launch(
                 'appsrc name=appsrc caps="{}" emit-signals=true ! filesink location={}'.format(
@@ -43,9 +46,9 @@ class FrameConverter:
         else:
             self.pipeline = Gst.parse_launch(
                 'appsrc name=appsrc caps="{}" emit-signals=true ! decodebin ! videoconvert ! \
-                 videoscale ! jpegenc ! {} ! filesink location={}'.format(
+                 videoscale method="lanczos" ! jpegenc ! {} ! filesink location="{}"'.format(
                     self.srccaps.to_string(),
-                    'image/jpeg, width={}, height={}'.format(self.width, self.height),
+                    'image/jpeg, width={}, height={}, pixel-aspect-ratio=1/1'.format(self.width, self.height),
                     self.dest
                 )
             )
@@ -56,17 +59,12 @@ class FrameConverter:
         
         self.appsrc = self.pipeline.get_by_name('appsrc')
         self.appsrc.connect('need-data', self.need_data)
-        
-        asyncio.ensure_future(self.cleanup_when_complete())
-        self.pipeline.set_state(Gst.State.PLAYING)
-        
+
     def need_data(self, appsrc, arg1):
         if self.sample:
-            print("pushin' sample")
             appsrc.push_sample(self.sample)
             self.sample = None
         else:
-            print("shovin' eos")
             appsrc.end_of_stream()
     
     def on_message(self, bus, msg):
@@ -80,8 +78,11 @@ class FrameConverter:
         elif msg.type == Gst.MessageType.EOS:
             self.complete = True
     
-    async def cleanup_when_complete(self):
+    async def convert(self):
+        self.pipeline.set_state(Gst.State.PLAYING)
+
         while not self.complete:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.25)
         
+        Gst.debug_bin_to_dot_file(self.pipeline, Gst.DebugGraphDetails.ALL, 'frameconverter')
         self.pipeline.set_state(Gst.State.NULL)
