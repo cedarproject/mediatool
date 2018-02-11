@@ -1,6 +1,9 @@
 import asyncio
 import sys
 
+import logging
+#logging.basicConfig(level = logging.DEBUG)
+
 from .analyze import Analyzer
 
 import gbulb

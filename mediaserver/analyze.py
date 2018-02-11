@@ -1,74 +1,74 @@
 import os
 import json
 import logging
+import tempfile
+
 import asyncio
+import aiohttp
+import socket
 
-import gi
-gi.require_version('Gst', '1.0')
-from gi.repository import Gst
-
-Gst.init(None)
-
+from .tracks import TrackAndTagGetter
 from .convert import FrameConverter
 from .grabber import FrameGrabber
 from .audioanalyzer import AudioAnalyzer
 
-from .taglist_utils import create_taglist_getters
-
 class Analyzer:
-    # TODO this should be split into two classes, one that does all the management stuff in analyze() and one to do the inital tracks data grab.
-    def __init__(self, directory, filename):
-        self.directory = directory
-        self.filename = filename
-        self.uri = 'file:///{}/{}'.format(directory, filename)
+    def __init__(self, _id, uri):
+        self._id = _id
+        self.uri = uri
         
         self.tracks = []
         self.metadata = {}
-        
-        self.tracks_done = False
         self.duration = None
+        
         self.poster_sample = None
-        
-        self.pipeline = Gst.Pipeline.new()
-        self.bus = self.pipeline.get_bus()
-        self.bus.add_signal_watch()
-        self.bus.connect('message', self.on_message)
-        
-        self.decodebin = Gst.ElementFactory.make('uridecodebin')
-        self.decodebin.connect('pad-added', self.pad_added)
-        self.decodebin.connect('no-more-pads', self.no_more_pads)
-        self.decodebin.set_property('uri', self.uri)
-        
-        self.pipeline.add(self.decodebin)
     
     def progress(self, amount):
-        print({'progress': amount})
+        print(json.dumps({'progress': amount}))
+    
+    async def download(self, uri, filename, force_ipv4 = False):
+        if force_ipv4:
+            conn = aiohttp.TCPConnector(family = socket.AF_INET)
+        else:
+            conn = aiohttp.TCPConnector()
         
+        async with aiohttp.ClientSession(connector = conn) as session:
+            async with session.get(uri) as resp:
+                with open(filename, 'wb') as fd:
+                    while True:
+                        chunk = await resp.content.read(10**6)
+                        if not chunk:
+                            break
+                        fd.write(chunk)
+
     async def analyze(self):
-        # TODO handle invalid files properly
         self.progress(0)
         
+        logging.info('Downloading URI {} to cache'.format(self.uri))
+        _dir = tempfile.gettempdir()
+
+        ext = self.uri.split('.')[-1]
+        filename = os.path.join(_dir, '{}.{}'.format(self._id, ext))
+        
+        try:
+            await self.download(self.uri, filename)
+        except aiohttp.client_exceptions.ClientConnectorError:
+            await self.download(self.uri, filename, force_ipv4 = True)
+        
+        self.uri = 'file://{}'.format(filename)
+        
+        logging.info('Finished downloading URI to cache')
+        
+        self.progress(1 / 4)
+        
         logging.info('Starting analysis of URI {}'.format(self.uri))
-        self.pipeline.set_state(Gst.State.PLAYING)
         
-        # Use decodebin to determine the media container's contents and get any metadata
-        while self.duration == None or not self.tracks_done:
-            res, state, pending = self.pipeline.get_state(10)
-            if self.duration == None and res == Gst.StateChangeReturn.SUCCESS and \
-                   (state == Gst.State.PAUSED or state == Gst.State.PLAYING):               
-                res, duration = self.decodebin.query_duration(Gst.Format.TIME)
-                if res:
-                    logging.info('Media duration is {}'.format(duration))
-                    self.duration = duration
-                else:
-                    self.duration = 0
-            
-            await asyncio.sleep(0.25)
+        self.tracks, self.metadata, self.duration, self.poster_sample = \
+            await TrackAndTagGetter(self.uri).go()
         
-        self.pipeline.set_state(Gst.State.NULL)
         logging.info('Completed track and tag analysis')
         
-        self.progress(1 / 3)
+        self.progress(2 / 4)
         
         # Start audio analysis
         audiofuture = None
@@ -113,7 +113,6 @@ class Analyzer:
 
         # Wait for audio tagging to complete, if in progress
         if audiofuture:
-            # TODO actually do thing
             replaygain, bpm = await audiofuture
             
             if self.metadata.get('replaygain') == None:
@@ -129,30 +128,30 @@ class Analyzer:
             self.poster_sample = await posterfuture
             logging.info('Poster frame grabbing complete')
         
-        self.progress(2 / 3)
+        self.progress(3 / 4)
         
         if self.poster_sample:
             logging.info('Starting poster and thumb frame convert and save jobs')
-            # TODO get directory to stuff these info from command-line args or whatever
-            postertitle = '{}.poster.jpg'.format(self.filename)
-            posterpath = os.path.join(self.directory, postertitle)
+            
+            postertitle = '{}.poster.jpg'.format(self._id)
+            posterpath = os.path.join(_dir, postertitle)
             pfc = FrameConverter(self.poster_sample, posterpath, max_width = 1920)
             pfuture = asyncio.ensure_future(pfc.convert())
 
-            thumbtitle = '{}.thumb.jpg'.format(self.filename)
-            thumbpath = os.path.join(self.directory, thumbtitle)
+            thumbtitle = '{}.thumb.jpg'.format(self._id)
+            thumbpath = os.path.join(_dir, thumbtitle)
             tfc = FrameConverter(self.poster_sample, thumbpath, width = 256)
             tfuture = asyncio.ensure_future(tfc.convert())
             
             await pfuture, tfuture
             logging.info('Created poster and thumbnail images')
         else:
-            postertitle = ''
-            thumbtitle = ''
+            posterpath = ''
+            thumbpath = ''
                 
         logging.info('Finished analysis of URI {}'.format(self.uri))
         
-        self.progress(3 / 3)
+        self.progress(4 / 4)
         
         _type = 'invalid'
 
@@ -166,99 +165,16 @@ class Analyzer:
                 _type = 'audio'
             elif track['type'] == 'image' and not _type == 'video' and not _type == 'audio':
                 _type = 'image'
-            
         
-        return {
+        # Delete cached file
+        os.unlink(filename)
+        
+        return json.dumps({
             'result': {
                 'type': _type,
                 'tracks': self.tracks,
                 'metadata': self.metadata,
-                'poster': postertitle,
-                'thumb': thumbtitle
+                'poster': posterpath,
+                'thumb': thumbpath
             }
-        }
-    
-    def on_message(self, bus, msg):
-        if msg.type == Gst.MessageType.ERROR:
-            Gst.debug_bin_to_dot_file(self.pipeline, Gst.DebugGraphDetails.ALL, 'analyze')
-            logging.error('GStreamer error for media {}: {}'.format(self.filename, msg.parse_error()))
-            self.duration = 0
-            self.tracks = []
-            self.tracks_done = True
-        
-        elif msg.type == Gst.MessageType.WARNING:
-            logging.warning('GStreamer warning for media {}: {}'.format(self.filename, msg.parse_error()))
-        
-        elif msg.type == Gst.MessageType.TAG:
-            tag_list = msg.parse_tag()
-            
-            gs, gu, gd = create_taglist_getters(tag_list)
-            
-            metadata = {
-                'album': gs(Gst.TAG_ALBUM),
-                'artist': gs(Gst.TAG_ARTIST),
-                'composer': gs(Gst.TAG_COMPOSER),
-                'genre': gs(Gst.TAG_GENRE),
-                'license': gs(Gst.TAG_LICENSE),
-                'performer': gs(Gst.TAG_PERFORMER),
-                'title': gs(Gst.TAG_TITLE),
-                'track-number': gu(Gst.TAG_TRACK_NUMBER),
-                'channel-mode': gs('channel-mode'),
-                'replaygain': gd(Gst.TAG_TRACK_GAIN),
-            }
-            
-            bpm = gd(Gst.TAG_BEATS_PER_MINUTE)
-            if bpm: metadata['bpm'] = round(bpm, 1)
-            
-            for k, v in metadata.items():
-                if not v == None: self.metadata[k] = v
-            
-            if not self.poster_sample:
-                found, sample = tag_list.get_sample(Gst.TAG_IMAGE)
-                if found:
-                    logging.info('Found poster image in file tag')
-                    self.poster_sample = sample
-                
-        elif msg.type == Gst.MessageType.EOS:
-            self.analyzing = False
-    
-    def pad_added(self, decodebin, pad):
-        caps = pad.get_current_caps()
-        
-        if caps:
-            struct = caps.get_structure(0)
-            logging.debug('Track found with caps: {}'.format(struct.to_string()))
-            
-            track = {'caps': caps}
-            suffix = '_{}'.format(len(self.tracks))
-
-            name = struct.get_name()
-            _type = name.split('/')[0]
-            
-            if _type == 'audio':
-                track['type'] = 'audio'
-                track['samplerate'] = struct.get_value('rate')
-            
-            elif _type == 'video':
-                track['width'] = struct.get_value('width')
-                track['height'] = struct.get_value('height')
-                
-                found, numerator, denominator = struct.get_fraction('framerate')
-                if numerator == 0: # Framerate of 0 means track is a still image
-                    track['type'] = 'image'
-                else:
-                    track['type'] = 'video'
-                    track['framerate'] = round(numerator / float(denominator), 2)
-                
-            else:
-                track['type'] = 'invalid'
-            
-            self.tracks.append(track)
-            
-            fake = Gst.ElementFactory.make('fakesink', 'fakesink' + suffix)
-            self.pipeline.add(fake)
-            pad.link(fake.get_static_pad('sink'))
-            fake.set_state(Gst.State.PLAYING)
-    
-    def no_more_pads(self, decodebin):
-        self.tracks_done = True
+        })
